@@ -467,6 +467,10 @@ class OpportunityRepository:
             kwargs["competitors_json"] = _encode_json_list(kwargs.pop("competitors"))
         if "source_links" in kwargs:
             kwargs["source_links_json"] = _encode_json_list(kwargs.pop("source_links"))
+        if "review_reasons" in kwargs:
+            kwargs["review_reasons_json"] = _encode_json_list(
+                kwargs.pop("review_reasons")
+            )
         opp = Opportunity(**kwargs)
         return self.add(opp, post_ids=post_ids)
 
@@ -542,3 +546,32 @@ class OpportunityRepository:
 
     def source_links(self, opp: Opportunity) -> list[str]:
         return _decode_json_list(opp.source_links_json)
+
+    def review_reasons(self, opp: Opportunity) -> list[str]:
+        """Return the review layer's reason tags for this opportunity."""
+        return _decode_json_list(opp.review_reasons_json)
+
+    def set_review(
+        self,
+        opportunity_id: int,
+        *,
+        verdict: str,
+        reasons: list[str],
+        summary: str,
+        confidence: float,
+    ) -> bool:
+        """Persist a review-layer result on an existing opportunity.
+
+        Returns True on success, False if the opportunity doesn't
+        exist. This is the only sanctioned way to write to the review
+        fields; the CLI / `opportunity_review` layer uses it.
+        """
+        opp = self.get_by_id(opportunity_id)
+        if opp is None:
+            return False
+        opp.review_verdict = verdict
+        opp.review_reasons_json = _encode_json_list(reasons)
+        opp.review_summary = summary
+        opp.review_confidence = float(confidence)
+        return True
+

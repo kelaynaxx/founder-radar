@@ -166,6 +166,108 @@ def test_audit_reality_help_flag() -> None:
 # Hacker News: end-to-end CLI without Reddit credentials
 # -------------------------------------------------------------------------
 
+def test_collect_hn_alias_routes_to_hackernews(monkeypatch, tmp_path) -> None:
+    """`--source hn` should behave identically to `--source hackernews`."""
+    import httpx
+    from founder_radar.main import app
+    from founder_radar.database.connection import get_session, init_engine
+
+    db_path = tmp_path / "hn.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("REPORTS_DIR", str(tmp_path / "reports"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("LOG_LEVEL", "WARNING")
+    from founder_radar.config.settings import get_settings
+    get_settings.cache_clear()
+    init_engine(f"sqlite:///{db_path}")
+
+    def handler(request):
+        if "askstories" in str(request.url):
+            return httpx.Response(200, json=[1])
+        if request.url.path == "/v0/item/1.json":
+            return httpx.Response(200, json={
+                "id": 1, "type": "story", "by": "alice",
+                "time": 1_700_000_000, "title": "Ask HN: what is the best way to scale Postgres?",
+                "score": 50, "descendants": 3,
+            })
+        return httpx.Response(404, json=None)
+
+    from founder_radar.collectors.hackernews import HackerNewsCollector
+    monkeypatch.setattr(
+        HackerNewsCollector, "_client",
+        lambda self: httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    from typer.testing import CliRunner
+    result = CliRunner().invoke(app, [
+        "collect", "--source", "hn", "--story-type", "askstories", "--limit", "1",
+    ])
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+    # The hn alias must have stored a post via the canonical hackernews
+    # collector, so the row's source column is "hackernews" (not "hn").
+    with get_session() as session:
+        from founder_radar.database.repository import PostRepository
+        rows = PostRepository(session).list_all()
+    assert len(rows) == 1
+    assert rows[0].source == "hackernews"
+
+
+def test_collect_hn_short_story_type_aliases(
+    monkeypatch, tmp_path,
+) -> None:
+    """--story-type ask / show / top / launch should be accepted."""
+    import httpx
+    from founder_radar.main import app
+    from founder_radar.database.connection import get_session, init_engine
+
+    db_path = tmp_path / "hn_alias.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("REPORTS_DIR", str(tmp_path / "reports"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("LOG_LEVEL", "WARNING")
+    from founder_radar.config.settings import get_settings
+    get_settings.cache_clear()
+    init_engine(f"sqlite:///{db_path}")
+
+    # Story-type short alias -> HN feed.
+    alias_to_endpoint = {
+        "ask": "askstories", "show": "showstories",
+        "top": "topstories", "launch": "showstories",
+    }
+    for short, endpoint in alias_to_endpoint.items():
+        def make_handler(ep):
+            def handler(request):
+                if ep in str(request.url) and "/v0/" in str(request.url)                         and not "/item/" in str(request.url):
+                    return httpx.Response(200, json=[42])
+                if request.url.path == "/v0/item/42.json":
+                    return httpx.Response(200, json={
+                        "id": 42, "type": "story", "by": "u",
+                        "time": 1_700_000_000, "title": f"{short} a real long-form title for testing the cleaner",
+                        "score": 1, "descendants": 0,
+                    })
+                return httpx.Response(404, json=None)
+            return handler
+        from founder_radar.collectors.hackernews import HackerNewsCollector
+        monkeypatch.setattr(
+            HackerNewsCollector, "_client",
+            lambda self, ep=endpoint: httpx.Client(
+                transport=httpx.MockTransport(make_handler(ep))
+            ),
+        )
+        result = CliRunner().invoke(app, [
+            "collect", "--source", "hackernews",
+            "--story-type", short, "--limit", "1",
+        ])
+        assert result.exit_code == 0, result.stdout + (result.stderr or "")
+        with get_session() as session:
+            from founder_radar.database.repository import PostRepository
+            rows = PostRepository(session).list_all()
+        # 1 post per iteration; the table accumulates across them.
+        assert any(r.external_id == "42" for r in rows),             f"short alias {short!r} did not produce a post"
+
+
 def test_collect_hackernews_runs_without_reddit_credentials(
     monkeypatch, tmp_path,
 ) -> None:
@@ -313,9 +415,194 @@ def test_tune_clusters_symbol_is_imported_in_main() -> None:
     This is a more obvious regression guard than running the full
     command — a one-line import-check is enough to catch a missing
     import that would otherwise only surface at runtime.
-    """
-    import founder_radar.main as cli_main
-    assert hasattr(cli_main, "GreedyCosineClusterer")
-    # The class should be the same one we use elsewhere.
-    from founder_radar.analysis.clustering import GreedyCosineClusterer
-    assert cli_main.GreedyCosineClusterer is GreedyCosineClusterer
+"""
+import founder_radar.main as cli_main
+assert hasattr(cli_main, "GreedyCosineClusterer")
+# The class should be the same one we use elsewhere.
+from founder_radar.analysis.clustering import GreedyCosineClusterer
+assert cli_main.GreedyCosineClusterer is GreedyCosineClusterer
+
+
+# -------------------------------------------------------------------------
+# productizable (Phase 4+ signal calibration)
+# -------------------------------------------------------------------------
+def test_productizable_help_works() -> None:
+    """`productizable --help` exits cleanly and documents the filters."""
+    result = runner.invoke(app, ["productizable", "--help"])
+    assert result.exit_code == 0
+    assert "opportunity_type" in result.stdout
+    assert "--type" in result.stdout
+    assert "--top" in result.stdout
+    assert "--min-score" in result.stdout
+    assert "--recalculate" in result.stdout
+    # The valid types are listed in the help text.
+    assert "potential_product" in result.stdout
+    assert "integration_pain" in result.stdout
+    assert "developer_workflow_pain" in result.stdout
+
+
+def test_productizable_on_empty_db() -> None:
+    """On an empty DB, the command exits cleanly with a 'no opportunities' hint."""
+    result = runner.invoke(app, ["productizable"])
+    assert result.exit_code == 0
+    assert "No opportunities" in result.stdout
+
+
+def test_productizable_rejects_unknown_type() -> None:
+    """Unknown --type values exit with code 2 (CLI usage error)."""
+    result = runner.invoke(app, ["productizable", "--type", "totally-bogus"])
+    assert result.exit_code == 2
+
+
+def test_productizable_accepts_exclude_flag() -> None:
+    """V2: --exclude TYPE (repeatable) is in --help and doesn't crash on empty DB."""
+    result = runner.invoke(app, ["productizable", "--help"])
+    assert result.exit_code == 0
+    assert "--exclude" in result.stdout
+    # On an empty DB, --exclude should be accepted and produce the
+    # "no opportunities" message.
+    result = runner.invoke(app, [
+        "productizable", "--exclude", "upstream_library_bug",
+        "--exclude", "repo_specific_bug",
+    ])
+    assert result.exit_code == 0
+    assert "No opportunities" in result.stdout
+
+
+def test_productizable_rejects_unknown_exclude_type() -> None:
+    """V2: unknown --exclude values exit with code 2."""
+    result = runner.invoke(
+    app, ["productizable", "--exclude", "totally-bogus"],
+    )
+    assert result.exit_code == 2
+
+
+# -------------------------------------------------------------------------
+# review-opportunities (Phase 4+ LLM-assisted review)
+# -------------------------------------------------------------------------
+def test_review_opportunities_help_works() -> None:
+    """`review-opportunities --help` exits cleanly and documents the flags."""
+    result = runner.invoke(app, ["review-opportunities", "--help"])
+    assert result.exit_code == 0
+    assert "--verdict" in result.stdout
+    assert "--exclude-rejected" in result.stdout
+    assert "--rerun-all" in result.stdout
+    assert "--use-heuristic" in result.stdout
+    # The valid verdicts are listed in the help text.
+    assert "strong_candidate" in result.stdout
+    assert "maybe" in result.stdout
+    assert "reject" in result.stdout
+
+
+def test_review_opportunities_on_empty_db() -> None:
+    """On an empty DB, the command exits cleanly with a hint."""
+    result = runner.invoke(app, ["review-opportunities", "--use-heuristic"])
+    assert result.exit_code == 0
+    assert "No opportunities" in result.stdout
+
+
+def test_review_opportunities_rejects_unknown_verdict() -> None:
+    """Unknown --verdict values exit with code 2."""
+    result = runner.invoke(
+        app, ["review-opportunities", "--use-heuristic", "--verdict", "great_product"],
+    )
+    assert result.exit_code == 2
+
+
+def test_review_opportunities_heuristic_rejects_non_potential_product() -> None:
+    """--use-heuristic returns 'reject' for non-`potential_product` clusters
+    and 'maybe' for `potential_product` clusters."""
+    from founder_radar.database.connection import get_session
+    from founder_radar.database.models import Base
+    from founder_radar.database.repository import OpportunityRepository
+    from founder_radar.database.connection import get_engine
+    from founder_radar.config.settings import get_settings as _get_settings
+    import json as _json
+
+    # Initialize the schema (already done by configured_db fixture).
+    get_engine()  # ensures engine
+
+    with get_session() as session:
+        repo = OpportunityRepository(session)
+        # Two opportunities: one potential_product, one repo_specific_bug.
+        potential = repo.add_from_dict(
+            {
+                "title": "Cross-tool workflow pain",
+                "problem_summary": "Pain",
+                "mentions": 5,
+                "opportunity_type": "potential_product",
+                "productizability_score": 0.75,
+                "weighted_score": 0.7,
+            }
+        )
+        bug = repo.add_from_dict(
+            {
+                "title": "TypeError on save",
+                "problem_summary": "Bug",
+                "mentions": 3,
+                "opportunity_type": "repo_specific_bug",
+                "productizability_score": 0.15,
+                "weighted_score": 0.3,
+            }
+        )
+
+    result = runner.invoke(
+        app, ["review-opportunities", "--use-heuristic", "--top", "10"],
+    )
+    assert result.exit_code == 0
+    # The `potential_product` op should land at 'maybe'.
+    assert "verdict=maybe" in result.stdout
+    assert "Cross-tool workflow pain" in result.stdout
+    # The repo_specific_bug op should be 'reject'.
+    assert "verdict=reject" in result.stdout
+    assert "TypeError on save" in result.stdout
+
+
+def test_review_opportunities_exclude_rejected_filter() -> None:
+    """--exclude-rejected hides reject verdicts."""
+    from founder_radar.database.connection import get_session
+    from founder_radar.database.repository import OpportunityRepository
+    from sqlalchemy import select as _sel
+    from founder_radar.database.models import Opportunity as _Op
+
+    with get_session() as session:
+        repo = OpportunityRepository(session)
+        opp = repo.add_from_dict(
+            {
+                "title": "Cross-tool workflow pain",
+                "problem_summary": "Pain",
+                "mentions": 5,
+                "opportunity_type": "potential_product",
+                "productizability_score": 0.75,
+            }
+        )
+        repo.set_review(
+            opp.id,
+            verdict="maybe",
+            reasons=["possible_micro_saas"],
+            summary="manual: maybe",
+            confidence=0.5,
+        )
+
+    result = runner.invoke(
+        app, [
+            "review-opportunities", "--use-heuristic",
+            "--rerun-all",
+            "--verdict", "maybe",
+            "--exclude-rejected",
+        ],
+    )
+    assert result.exit_code == 0
+    # Even though no --verdict reject, --exclude-rejected filters
+    # them out anyway. The maybe row should be shown.
+    assert "Cross-tool workflow pain" in result.stdout
+    assert "filter: --exclude-rejected" in result.stdout
+
+
+def test_review_opportunities_rejects_unknown_verdict_quietly() -> None:
+    """--verdict is validated against the canonical set."""
+    # Without the right API key, --use-heuristic lets the CLI proceed.
+    result = runner.invoke(
+        app, ["review-opportunities", "--use-heuristic", "--verdict", "unknown_type"],
+    )
+    assert result.exit_code == 2

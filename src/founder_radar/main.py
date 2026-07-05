@@ -38,13 +38,19 @@ import typer
 
 from founder_radar import __version__
 from founder_radar.analysis import (
-    HeuristicExtractor,
-    InMemoryVectorStore,
-    build_clusterer,
-    build_embedder,
-    build_extractor,
-    run_reality_check,
-    run_trend_analysis,
+    ALL_REVIEW_VERDICTS,
+ALL_TYPES as ALL_OPPORTUNITY_TYPES,
+HeuristicExtractor,
+InMemoryVectorStore,
+TYPE_POTENTIAL_PRODUCT,
+build_clusterer,
+build_embedder,
+build_extractor,
+    classify_opportunity,
+    review_opportunity,
+    review_opportunities_batch,
+run_reality_check,
+run_trend_analysis,
 )
 from founder_radar.analysis.clustering import GreedyCosineClusterer
 from founder_radar.collectors import (
@@ -65,8 +71,9 @@ from founder_radar.database.repository import (
     decode_vector,
 )
 from founder_radar.processors import Cleaner
+from founder_radar.llm.base import LLMMessage
+from founder_radar.llm.openai_provider import OpenAICompatibleProvider
 from founder_radar.reports import MarkdownReport
-
 # `app` is the Typer application. The pyproject.toml entry point binds it
 # to the `founder-radar` console script.
 app = typer.Typer(
@@ -121,7 +128,7 @@ def collect(
         "reddit", "--source", "-s",
         help=(
             "Which source to collect from. "
-            "Registered: 'reddit', 'hackernews'. "
+            "Registered: 'reddit', 'hackernews', 'github'. "
             "Add new sources via collectors/ and register_builtins()."
         ),
     ),
@@ -138,11 +145,53 @@ def collect(
             "Default (when this flag is omitted): settings.default_hn_story_types."
         ),
     ),
+    repo: list[str] = typer.Option(
+        None, "--repo",
+        help=(
+            "(GitHub) One or more 'owner/name' repositories to scan for "
+            "issues. Repeat the flag for multiple, e.g. "
+            "`--repo openai/openai-python --repo langchain-ai/langchain`. "
+            "When set, /repos/{owner}/{name}/issues is fetched."
+        ),
+    ),
+    query: Optional[str] = typer.Option(
+        None, "--query", "-q",
+        help=(
+            "Full-text search via the source's search API. "
+            "For Hacker News: the Algolia HN Search API (e.g. "
+            "`--query \"pain problem frustrated\"`). "
+            "For GitHub: the public /search/issues endpoint. Supports "
+            "qualifiers like `is:issue is:open label:bug`, `repo:owner/name`, "
+            "and free-text terms (e.g. `--query \"is:issue is:open \\\"feature request\\\" automation\"`)."
+        ),
+    ),
     include_comments: bool = typer.Option(
         False, "--include-comments",
         help=(
             "(Hacker News) Also fetch up to 5 first-level comments per story. "
             "Disabled by default — stories only."
+        ),
+    ),
+    include_closed: bool = typer.Option(
+        False, "--include-closed",
+        help=(
+            "(GitHub) Include closed issues as well as open ones. "
+            "Default behavior collects open issues only."
+        ),
+    ),
+    include_bots: bool = typer.Option(
+        False, "--include-bots",
+        help=(
+            "(GitHub) Keep issues authored by automated bot accounts "
+            "(dependabot, renovate, github-actions, ...). Default "
+            "behavior filters them out at collection time."
+        ),
+    ),
+    include_templates: bool = typer.Option(
+        False, "--include-templates",
+        help=(
+            "(GitHub) Keep template-only issues (no body, generic title). "
+            "Default behavior filters them out at collection time."
         ),
     ),
     limit: Optional[int] = typer.Option(None, "--limit", "-l"),
@@ -155,12 +204,19 @@ def collect(
         founder-radar collect --subreddit entrepreneur --limit 25
         founder-radar collect --source hackernews --story-type askstories --limit 100
         founder-radar collect --source hackernews --include-comments
+        founder-radar collect --source github --repo openai/openai-python --limit 100
+        founder-radar collect --source github --repo langchain-ai/langchain --limit 100
+        founder-radar collect --source github --query "is:issue is:open label:bug" --limit 100
+        founder-radar collect --source github --query 'is:issue is:open "feature request" automation' --limit 100
     """
     _bootstrap()
     settings = get_settings()
 
     # Discover available collectors via the registry.
     register_builtins()
+    # Source aliases: "hn" is the short form for "hackernews".
+    source_aliases = {"hn": "hackernews"}
+    source = source_aliases.get(source, source)
     if source not in registry.all_names():
         typer.echo(
             f"Source {source!r} not available. "
@@ -170,18 +226,103 @@ def collect(
         raise typer.Exit(code=2)
 
     # Dispatch to the right collector. Reddit uses --subreddit; HN uses
-    # --story-type. Unknown collectors fall through to a generic path
-    # that uses `categories` as-is.
+    # --story-type; GitHub uses --repo and/or --query. Unknown collectors
+    # fall through to a generic path that uses `categories` as-is.
     if source == "reddit":
         from founder_radar.collectors import RedditCollector
         categories = subreddit or None
         collector = RedditCollector(settings)
-    elif source == "hackernews":
+    elif source in ("hackernews", "hn"):
+        # Source alias: "hn" is the short form the user uses in their
+        # calibration workflow; "hackernews" is the canonical name.
         from founder_radar.collectors import HackerNewsCollector
-        categories = story_type or None
+        # Short story-type aliases the user asked for: ask, show, top,
+        # new, best, job, launch. launch maps to showstories (HN has
+        # no separate launch feed; launches go in showstories).
+        type_aliases = {
+            "ask": "askstories", "show": "showstories",
+            "top": "topstories", "new": "newstories",
+            "best": "beststories", "job": "jobstories",
+            "launch": "showstories",
+        }
+        categories = (
+            [type_aliases.get(s.strip().lower(), s.strip())
+             for s in (story_type or [])]
+            if story_type else None
+        )
+        if query:
+            # When --query is set, pass it through to the collector.
+            # The collector routes to the Algolia path; the Firebase
+            # story-list endpoints are bypassed.
+            collector = HackerNewsCollector(
+                settings, include_comments=include_comments
+            )
+            raw_posts = list(collector.collect(
+                categories=categories,
+                limit_per_category=limit,
+                query=query,
+            ))
+            typer.echo(
+                f"Collected {len(raw_posts)} raw post(s) from hackernews "
+                f"(Algolia query={query!r})."
+            )
+            if not raw_posts:
+                typer.echo("Nothing to do.")
+                return
+            cleaned = raw_posts if skip_clean else Cleaner().process(raw_posts)
+            typer.echo(f"After cleaning: {len(cleaned)} posts.")
+            if dry_run:
+                typer.echo("Dry run: not writing to database.")
+                return
+            with get_session() as session:
+                repo = PostRepository(session)
+                inserted = repo.add_many(_raw_to_orm(r) for r in cleaned)
+            typer.echo(
+                f"Inserted {inserted} new post(s) into the database."
+            )
+            return
         collector = HackerNewsCollector(
             settings, include_comments=include_comments
         )
+    elif source == "github":
+        from founder_radar.collectors import GitHubIssuesCollector
+        if not repo and not query:
+            typer.echo(
+                "GitHub collector needs --repo and/or --query. "
+                "Example: --repo openai/openai-python or "
+                "--query \"is:issue is:open label:bug\".",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        collector = GitHubIssuesCollector(
+            settings,
+            include_closed=include_closed,
+            include_bots=include_bots,
+            include_templates=include_templates,
+        )
+        raw_posts = list(collector.collect(
+            limit_per_category=limit,
+            repos=repo or None,
+            query=query,
+        ))
+        typer.echo(
+            f"Collected {len(raw_posts)} raw post(s) from github."
+        )
+        if not raw_posts:
+            typer.echo("Nothing to do.")
+            return
+        cleaned = raw_posts if skip_clean else Cleaner().process(raw_posts)
+        typer.echo(f"After cleaning: {len(cleaned)} posts.")
+        if dry_run:
+            typer.echo("Dry run: not writing to database.")
+            return
+        with get_session() as session:
+            db_repo = PostRepository(session)
+            inserted = db_repo.add_many(_raw_to_orm(r) for r in cleaned)
+        typer.echo(
+            f"Inserted {inserted} new post(s) into the database."
+        )
+        return
     else:
         # Generic fallback for future collectors.
         collector_cls = registry.get(source)
@@ -614,7 +755,23 @@ def extract(
             "a 1-post 'opportunity' is not a real opportunity."
         ),
     ),
-    force_heuristic: bool = typer.Option(False, "--heuristic"),
+    force_heuristic: bool = typer.Option(
+        False, "--heuristic", hidden=True,
+        help=typer.style(
+            "(deprecated) use --method heuristic instead",
+            fg="yellow",
+        ),
+    ),
+    method: Optional[str] = typer.Option(
+        None, "--method", "-m",
+        help=(
+            "Extraction method. One of: 'heuristic', 'llm', 'auto'. "
+            "'auto' (default): uses LLM if LLM_API_KEY is set, else "
+            "heuristic. Pass --method heuristic to FORCE the heuristic "
+            "extractor even when an LLM key is present (useful when "
+            "debugging or when the LLM is rate-limiting)."
+        ),
+    ),
 ) -> None:
     """Run opportunity extraction over clustered posts.
 
@@ -622,16 +779,47 @@ def extract(
     opportunities. This prevents the "564 posts -> 551 fake
     opportunities" pathology where every singleton post is mistaken
     for a market signal.
+
+    Use --method heuristic to skip the LLM call entirely, even when
+    LLM_API_KEY is set. Use --method llm to force the LLM path even
+    when --heuristic was the default (e.g. to override a missing
+    LLM key configuration for a one-off run).
     """
     _bootstrap()
     settings = get_settings()
     threshold = min_cluster_size if min_cluster_size is not None else settings.extract_min_cluster_size
 
-    if force_heuristic:
+    # Resolve extraction method.
+    # - --heuristic is the legacy flag; maps to --method heuristic.
+    # - --method heuristic forces heuristic extractor.
+    # - --method llm forces LLM extractor (errors if LLM not configured).
+    # - --method auto (default) or None: use LLM if key present, else heuristic.
+    if force_heuristic and method and method != "heuristic":
+        typer.echo(
+            "Conflicting flags: --heuristic and --method. Using --method.",
+            err=True,
+        )
+    requested = "heuristic" if force_heuristic else (method or "auto")
+    if requested == "auto":
+        requested = "llm" if settings.llm_api_key else "heuristic"
+    if requested == "heuristic":
         extractor: object = HeuristicExtractor()
-    else:
+    elif requested == "llm":
+        if not settings.llm_api_key:
+            typer.echo(
+                "--method llm requires LLM_API_KEY. Either set it in .env "
+                "or pass --method heuristic.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         extractor = build_extractor(settings)
-    typer.echo(f"Extractor: {getattr(extractor, 'name', '?')}")
+    else:
+        typer.echo(
+            f"Unknown --method {requested!r}. Expected: heuristic, llm, auto.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    typer.echo(f"Extractor: {getattr(extractor, 'name', '?')} (requested: {requested})")
     typer.echo(f"Min cluster size: {threshold} (--include-singletons: {include_singletons})")
 
     with get_session() as session:
@@ -965,8 +1153,409 @@ def opportunities(
 
 
 # =============================================================================
-# opportunity (Phase 3 — inspection)
+# productizable (Phase 4+ — opportunity-type calibration)
 # =============================================================================
+@app.command()
+def productizable(
+    top: int = typer.Option(30, "--top", "-k", help="Number of opportunities to show."),
+    type: Optional[str] = typer.Option(  # noqa: A002 (intentional shadow)
+        None, "--type", "-t",
+        help=(
+            "Filter by opportunity_type. One of: repo_specific_bug, "
+            "upstream_library_bug, documentation_confusion, missing_feature, "
+            "integration_pain, developer_workflow_pain, "
+            "infra_operational_pain, security_compliance_pain, "
+            "potential_product, unknown."
+        ),
+    ),
+    exclude: list[str] = typer.Option(
+        None, "--exclude", "-X",
+        help=(
+            "Exclude one or more opportunity_type values from the result. "
+            "Repeat the flag. Useful for hiding noise like "
+            "`--exclude upstream_library_bug --exclude repo_specific_bug` "
+            "to focus on real product opportunities."
+        ),
+    ),
+    min_productizability: float = typer.Option(
+        0.0, "--min-score", "-s",
+        help="Only show opportunities with productizability_score >= this.",
+    ),
+    recalculate: bool = typer.Option(
+        False, "--recalculate",
+        help=(
+            "Re-run the classifier on every opportunity and persist the "
+            "result. Without this flag, the command just reads what's "
+            "already on disk."
+        ),
+    ),
+) -> None:
+    """Show opportunities by opportunity_type and productizability.
+
+    Output columns (one row per opportunity):
+      id, title, weighted_score, reality_status, opportunity_type,
+      productizability_score, productizability_reason
+
+    Filter by type:
+      founder-radar productizable --type potential_product
+      founder-radar productizable --type integration_pain
+      founder-radar productizable --type developer_workflow_pain
+
+    Exclude noise:
+      founder-radar productizable --exclude upstream_library_bug
+      founder-radar productizable --exclude upstream_library_bug --exclude repo_specific_bug
+    """
+    _bootstrap()
+
+    # Validate --type and --exclude early.
+    if type is not None and type not in ALL_OPPORTUNITY_TYPES:
+        typer.echo(
+            f"Unknown --type {type!r}. "
+            f"Valid: {', '.join(ALL_OPPORTUNITY_TYPES)}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if exclude:
+        for ex in exclude:
+            if ex not in ALL_OPPORTUNITY_TYPES:
+                typer.echo(
+                    f"Unknown --exclude {ex!r}. "
+                    f"Valid: {', '.join(ALL_OPPORTUNITY_TYPES)}",
+                    err=True,
+                )
+                raise typer.Exit(code=2)
+
+    with get_session() as session:
+        opp_repo = OpportunityRepository(session)
+        opps = list(opp_repo.list_all(limit=None))
+        if not opps:
+            typer.echo("No opportunities yet. Run `founder-radar extract` first.")
+            raise typer.Exit(code=0)
+
+        if recalculate:
+            from sqlalchemy import select  # noqa: PLC0415
+            from founder_radar.database.models import Post  # noqa: PLC0415
+            post_ids_flat: set[int] = set()
+            for opp in opps:
+                post_ids_flat.update(opp_repo.list_post_ids(opp.id))
+            # Batch-load the posts.
+            posts_by_id: dict = {}
+            if post_ids_flat:
+                post_rows = session.execute(
+                    select(Post).where(Post.id.in_(post_ids_flat))
+                ).scalars().all()
+                posts_by_id = {p.id: p for p in post_rows}
+
+            updated = 0
+            for opp in opps:
+                ids = opp_repo.list_post_ids(opp.id)
+                posts = [posts_by_id[i] for i in ids if i in posts_by_id]
+                if not posts:
+                    continue
+                assessment = classify_opportunity(opp, posts)
+                opp.opportunity_type = assessment.opportunity_type
+                opp.productizability_score = assessment.productizability_score
+                opp.productizability_reason = assessment.productizability_reason
+                updated += 1
+            typer.echo(f"Recalculated types for {updated} opportunit"
+                       f"{'y' if updated == 1 else 'ies'}.")
+
+    # Apply filters.
+    exclude_set = set(exclude or [])
+    filtered = []
+    for opp in opps:
+        if type is not None and opp.opportunity_type != type:
+            continue
+        if opp.opportunity_type in exclude_set:
+            continue
+        if (opp.productizability_score or 0.0) < min_productizability:
+            continue
+        filtered.append(opp)
+    # Sort: by productizability_score desc, then weighted_score desc.
+    filtered.sort(
+        key=lambda o: (
+            -(o.productizability_score or 0.0),
+            -(o.weighted_score or 0.0),
+        )
+    )
+    shown = filtered[:top]
+
+    if not shown:
+        typer.echo("No opportunities match the current filters.")
+        raise typer.Exit(code=0)
+
+    typer.echo(
+        f"{len(shown)} opportunit{'y' if len(shown) == 1 else 'ies'} "
+        f"(of {len(filtered)} match{'es' if len(filtered) != 1 else ''}, "
+        f"{len(opps)} total)"
+    )
+    if type is not None:
+        typer.echo(f"  filter: type={type}")
+    if exclude:
+        typer.echo(f"  filter: exclude={','.join(exclude)}")
+    if min_productizability > 0:
+        typer.echo(f"  filter: min_score>={min_productizability}")
+    typer.echo("")
+    for opp in shown:
+        typer.echo(
+            f"[id={opp.id}] (weighted={opp.weighted_score:.2f}, "
+            f"reality={opp.reality_status}) "
+            f"{opp.title}"
+        )
+        typer.echo(
+            f"    type={opp.opportunity_type:<26} "
+            f"productizability={opp.productizability_score:.2f}"
+        )
+        if opp.productizability_reason:
+            typer.echo(f"    reason: {opp.productizability_reason}")
+        typer.echo("")
+
+@app.command()
+def review_opportunities(
+    top: int = typer.Option(50, "--top", "-k", help="Number of opportunities to review."),
+    verdict: Optional[str] = typer.Option(  # noqa: A002
+        None, "--verdict",
+        help=(
+            "Filter to opportunities with this review verdict "
+            "(strong_candidate, maybe, reject). "
+            "Default: show all verdicts."
+        ),
+    ),
+    exclude_rejected: bool = typer.Option(
+        False, "--exclude-rejected",
+        help="Hide rows whose review_verdict is 'reject'. "
+             "Useful for showing only potential survivors.",
+    ),
+    rerun_all: bool = typer.Option(
+        False, "--rerun-all",
+        help=(
+            "Re-review every opportunity, even ones that already have "
+            "a verdict. Without this flag, only un-reviewed opportunities "
+            "are sent to the LLM."
+        ),
+    ),
+    use_heuristic: bool = typer.Option(
+        False, "--use-heuristic",
+        help=(
+            "Run the review layer against the heuristic classifier "
+            "instead of the LLM. Useful for smoke tests without a "
+            "configured LLM endpoint. Always returns 'reject' for "
+            "non-`potential_product` clusters and 'maybe' for the rest."
+        ),
+    ),
+) -> None:
+    """LLM-assisted opportunity review (triage filter).
+
+    Acts like a strict startup-analyst filter on top of the
+    deterministic `opportunity_type` + `productizability_score`. The
+    classifier says "this cluster LOOKS productizable"; this command
+    asks an LLM (default) or a heuristic (--use-heuristic) "is this
+    cluster ACTUALLY a product opportunity?"
+
+    The LLM is configured via Settings.llm_api_key / llm_base_url.
+    With no LLM_API_KEY set, the command exits with an error
+    unless --use-heuristic is passed.
+
+    Output columns (one row per opportunity):
+      id, title, opportunity_type, productizability_score,
+      review_verdict, review_reasons, review_summary, review_confidence
+
+    Filters:
+      --verdict strong_candidate
+      --verdict maybe
+      --verdict reject
+      --exclude-rejected        hide all reject verdicts
+    """
+    _bootstrap()
+    settings = get_settings()
+
+    if verdict is not None and verdict not in ALL_REVIEW_VERDICTS:
+        typer.echo(
+            f"Unknown --verdict {verdict!r}. "
+            f"Valid: {', '.join(ALL_REVIEW_VERDICTS)}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Resolve LLM provider.
+    llm = None
+    if not use_heuristic:
+        if not settings.llm_api_key:
+            typer.echo(
+                "LLM_API_KEY is not set. Either set it in .env or pass "
+                "--use-heuristic to run a deterministic fallback.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        llm = OpenAICompatibleProvider(settings)
+        typer.echo(
+            f"Using LLM provider: {llm.name} "
+            f"(model={settings.llm_model})"
+        )
+    else:
+        typer.echo("Using --use-heuristic fallback (no LLM).")
+
+    with get_session() as session:
+        opp_repo = OpportunityRepository(session)
+        opps = list(opp_repo.list_all(limit=None))
+        if not opps:
+            typer.echo(
+                "No opportunities yet. Run `founder-radar extract` first."
+            )
+            raise typer.Exit(code=0)
+
+        # Build the post-id -> list[Post] map once.
+        from sqlalchemy import select as _sa_select  # noqa: PLC0415
+        from founder_radar.database.models import (  # noqa: PLC0415
+            OpportunityPost, Post as _PostModel,
+        )
+        opp_ids = [o.id for o in opps if o.id is not None]
+        posts_by_id: dict = {oid: [] for oid in opp_ids}
+        if opp_ids:
+            link_rows = session.execute(
+                _sa_select(
+                    OpportunityPost.opportunity_id,
+                    OpportunityPost.post_id,
+                )
+            ).all()
+            post_ids_flat = {row[1] for row in link_rows}
+            if post_ids_flat:
+                post_rows = session.execute(
+                    _sa_select(_PostModel).where(
+                        _PostModel.id.in_(post_ids_flat)
+                    )
+                ).scalars().all()
+                posts_map = {p.id: p for p in post_rows}
+            else:
+                posts_map = {}
+            for opp_id, post_id in link_rows:
+                if opp_id in posts_by_id and post_id in posts_map:
+                    posts_by_id[opp_id].append(posts_map[post_id])
+
+        # Decide which opps need (re-)review.
+        targets = []
+        for opp in opps:
+            if opp.id is None:
+                continue
+            if rerun_all or opp.review_verdict is None:
+                targets.append(opp)
+        if not targets:
+            typer.echo(
+                f"All {len(opps)} opportunities are already reviewed. "
+                "Pass --rerun-all to re-review."
+            )
+        else:
+            typer.echo(
+                f"Reviewing {len(targets)} opportunit"
+                f"{'y' if len(targets) == 1 else 'ies'} "
+                f"(of {len(opps)} total) ..."
+            )
+            if llm is not None:
+                results = review_opportunities_batch(
+                    targets, posts_by_id, llm, progress=False,
+                )
+            else:
+                results = _heuristic_review_batch(targets, posts_by_id)
+            for opp_id, verdict_obj in results.items():
+                opp_repo.set_review(
+                    opp_id,
+                    verdict=verdict_obj.verdict,
+                    reasons=verdict_obj.reasons,
+                    summary=verdict_obj.summary,
+                    confidence=verdict_obj.confidence,
+                )
+
+    # Display: re-fetch from DB so we see persisted state.
+    with get_session() as session:
+        opp_repo = OpportunityRepository(session)
+        all_opps = list(opp_repo.list_all(limit=None))
+
+        def _verdict_of(opp) -> str:
+            return opp.review_verdict or "reject"
+
+        if verdict is not None:
+            filtered = [o for o in all_opps if _verdict_of(o) == verdict]
+        else:
+            filtered = list(all_opps)
+        if exclude_rejected:
+            filtered = [o for o in filtered if _verdict_of(o) != "reject"]
+        verdict_order = {
+            "strong_candidate": 0, "maybe": 1, "reject": 2,
+        }
+        filtered.sort(
+            key=lambda o: (
+                verdict_order.get(_verdict_of(o), 3),
+                -(o.productizability_score or 0.0),
+            )
+        )
+        shown = filtered[:top]
+
+    if not shown:
+        typer.echo("No opportunities match the current filters.")
+        raise typer.Exit(code=0)
+
+    n_rejected = sum(1 for o in shown if _verdict_of(o) == "reject")
+    n_maybe = sum(1 for o in shown if _verdict_of(o) == "maybe")
+    n_strong = sum(1 for o in shown if _verdict_of(o) == "strong_candidate")
+    typer.echo(
+        f"{len(shown)} opportunit{'y' if len(shown) == 1 else 'ies'} "
+        f"(strong={n_strong}, maybe={n_maybe}, reject={n_rejected}, "
+        f"of {len(filtered)} match, {len(all_opps)} total)"
+    )
+    if verdict is not None:
+        typer.echo(f"  filter: verdict={verdict}")
+    if exclude_rejected:
+        typer.echo("  filter: --exclude-rejected")
+    typer.echo("")
+
+    for opp in shown:
+        v = _verdict_of(opp)
+        typer.echo(
+            f"[id={opp.id}] (type={opp.opportunity_type}, "
+            f"productizability={opp.productizability_score:.2f}, "
+            f"verdict={v}, conf={opp.review_confidence:.2f}) "
+            f"{opp.title}"
+        )
+        reasons = opp_repo.review_reasons(opp)
+        if reasons:
+            typer.echo(f"    reasons: {','.join(reasons)}")
+        if opp.review_summary:
+            typer.echo(f"    summary: {opp.review_summary[:300]}")
+        typer.echo("")
+
+
+def _heuristic_review_batch(opps, posts_by_id):
+    """Deterministic fallback when --use-heuristic is passed.
+
+    Returns {opp_id: ReviewVerdict}. Always says 'reject' for
+    non-`potential_product` clusters and 'maybe' for the rest.
+    Used for smoke tests and offline operation; never returns
+    'strong_candidate' (that's reserved for the LLM).
+    """
+    from founder_radar.analysis.opportunity_review import (
+        ReviewVerdict,
+        REVIEW_VERDICT_MAYBE,
+        REVIEW_VERDICT_REJECT,
+    )
+    out: dict = {}
+    for opp in opps:
+        if opp.opportunity_type == "potential_product":
+            out[opp.id] = ReviewVerdict(
+                verdict=REVIEW_VERDICT_MAYBE,
+                reasons=["possible_micro_saas"],
+                summary="heuristic: potential_product cluster (no LLM verdict)",
+                confidence=0.0,
+            )
+        else:
+            out[opp.id] = ReviewVerdict(
+                verdict=REVIEW_VERDICT_REJECT,
+                reasons=["too_repo_specific"],
+                summary="heuristic: not a potential_product cluster",
+                confidence=0.0,
+            )
+    return out
+
+
 @app.command()
 def opportunity(
     opportunity_id: int = typer.Argument(..., help="Opportunity id to show."),
@@ -1495,6 +2084,254 @@ def info() -> None:
             typer.echo("  llm_extraction      = enabled (LLM_API_KEY set)")
         else:
             typer.echo("  llm_extraction      = disabled (heuristic only)")
+
+
+@app.command()
+def llm_smoke_test(
+    debug_request: bool = typer.Option(
+        False, "--debug-request",
+        help=(
+            "Print a sanitized view of the request payload that would "
+            "be sent to the provider (model, response_format, "
+            "reasoning_split, thinking, reasoning, timeout). Does NOT "
+            "make an HTTP call. Use this to verify provider-specific "
+            "fields (e.g. MiniMax-M3 reasoning_split=true) are wired "
+            "correctly before spending a real call."
+        ),
+    ),
+) -> None:
+    """Smoke-test the configured LLM provider end-to-end.
+
+    Exercises:
+      - Provider connectivity (one chat completion call).
+      - Model name surfacing.
+      - Strict JSON response (response_format=json_object).
+      - <think>...</think> block stripping (reasoning-model behaviour).
+      - reasoning_split flag handling (top-level pass-through).
+      - Retry-repair pass when the first parse fails.
+
+    With no LLM_API_KEY set, the command exits with code 2 and a clear
+    message. `--debug-request` is supported WITHOUT an API key because
+    it does not make a network call.
+
+    Findings semantics:
+      - PASS: the response parses as a JSON dict (initial or after repair).
+      - WARN: a <think>...</think> block was present but JSON parsed after
+        stripping — the model is leaking its reasoning trace. Consider
+        setting LLM_REASONING_SPLIT=true or LLM_THINKING_MODE=disabled.
+      - FAIL: the response did not parse as JSON even after think-stripping
+        AND retry-repair.
+
+    The point of this command is to make reasoning-model debugging
+    cheap: one call (or zero, with --debug-request), one report, no DB
+    writes. Run it after editing LLM_REASONING_SPLIT /
+    LLM_THINKING_MODE / LLM_RESPONSE_FORMAT and BEFORE running the full
+    `extract` or `review-opportunities`.
+    """
+    _bootstrap()
+    settings = get_settings()
+
+    if debug_request:
+        provider = OpenAICompatibleProvider(settings)
+        test_messages = [
+            LLMMessage(
+                role="system",
+                content=(
+                    "You are a JSON echo. Respond with one object: "
+                    '{"ok": true, "model_acknowledged": "<model-name>"} '
+                    "with no commentary, no markdown fences, no "
+                    "<think>...</think> blocks."
+                ),
+            ),
+            LLMMessage(role="user", content="Smoke test."),
+        ]
+        payload = provider.build_request_payload(
+            test_messages,
+            temperature=0.0,
+            max_tokens=200,
+        )
+        typer.echo("---- sanitized request payload ----")
+        typer.echo(f"  url:                       {provider._url()}")
+        typer.echo(f"  model:                     {payload.get('model')!r}")
+        typer.echo(
+            f"  response_format:           "
+            f"{payload.get('response_format', '(omitted)')!r}"
+        )
+        typer.echo(
+            f"  reasoning_split:           "
+            f"{payload.get('reasoning_split', '(omitted)')!r}"
+        )
+        typer.echo(
+            f"  thinking:                  "
+            f"{payload.get('thinking', '(omitted)')!r}"
+        )
+        typer.echo(
+            f"  reasoning:                 "
+            f"{payload.get('reasoning', '(omitted)')!r}"
+        )
+        typer.echo(
+            f"  extra_body:                "
+            f"{payload.get('extra_body', '(none — fields at top level)')!r}"
+        )
+        typer.echo(f"  timeout_seconds:           {provider._timeout}")
+        typer.echo(f"  max_tokens:                200")
+        typer.echo(f"  temperature:               0.0")
+        typer.echo(
+            f"  authorization_header:      "
+            f"{'present (api_key configured)' if settings.llm_api_key else 'omitted'}"
+        )
+        typer.echo(
+            f"  api_key:                   (never printed)"
+        )
+        typer.echo(
+            f"  llm_strip_thinking_always: {settings.llm_strip_thinking_always}"
+        )
+        typer.echo("----------------------------------")
+        return
+
+    if not settings.llm_api_key:
+        typer.echo(
+            "LLM_API_KEY is not set. Set it in .env or your shell, then "
+            "re-run this command. (The smoke test always makes one real "
+            "chat-completion call to the configured endpoint.) "
+            "Pass --debug-request to print the payload without calling.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    provider = OpenAICompatibleProvider(settings)
+
+    # Single chat completion asking for strict JSON. We use a minimal
+    # schema so the call is cheap regardless of model.
+    test_messages = [
+        LLMMessage(
+            role="system",
+            content=(
+                "You are a JSON echo. Respond with one object: "
+                '{"ok": true, "model_acknowledged": "<model-name>"} '
+                "with no commentary, no markdown fences, no "
+                "<think>...</think> blocks."
+            ),
+        ),
+        LLMMessage(role="user", content="Smoke test."),
+    ]
+
+    typer.echo(f"Provider: {provider.name}")
+    typer.echo(f"Endpoint: {settings.llm_base_url}")
+    typer.echo(f"Model: {settings.llm_model}")
+    typer.echo(
+        f"Settings: reasoning_split={settings.llm_reasoning_split} "
+        f"thinking_mode={settings.llm_thinking_mode!r} "
+        f"response_format={settings.llm_response_format!r} "
+        f"strip_thinking_always={settings.llm_strip_thinking_always} "
+        f"timeout={provider._timeout}s"
+    )
+    typer.echo("Calling /chat/completions once...")
+
+    try:
+        resp = provider.complete(
+            test_messages,
+            temperature=0.0,
+            max_tokens=200,
+        )
+    except Exception as exc:
+        typer.echo(f"FAIL: provider call failed: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+    content = resp.content or ""
+    # When strip_thinking_always=True, the provider has already stripped
+    # <think> blocks before returning. We respect that and don't print
+    # the raw preview — only show its length.
+    if settings.llm_strip_thinking_always:
+        typer.echo(
+            f"Response received (length={len(content)} chars; "
+            "thinking blocks already stripped by provider)."
+        )
+    else:
+        typer.echo("---- response content (first 400 chars) ----")
+        typer.echo(content[:400])
+        typer.echo("--------------------------------------------")
+
+    # Use the shared JSON pipeline so the smoke test mirrors what
+    # `extract` and `review-opportunities` actually see.
+    from founder_radar.analysis.llm_json import (
+        extract_json,
+        make_repair_callback,
+        parse_with_repair,
+    )
+
+    # Detect thinking blocks in the *raw* response (pre-stripping) so
+    # we can WARN even when strip_thinking_always is on. The provider
+    # set LLMResponse.content from message.content, so we look there.
+    # Note: if strip_thinking_always=True, the provider has already
+    # stripped content before we got it; we can still detect whether
+    # the original model emitted a block by checking the response
+    # length or the "raw_response" attribute on LLMResponse. The
+    # base provider doesn't carry raw_response, so for the smoke test
+    # we approximate with the stripped content.
+    has_think_in_visible = "<think>" in content.lower()
+
+    findings: list[str] = []
+    parsed = None
+    parse_error: str | None = None
+    try:
+        parsed = extract_json(content)
+    except Exception as exc:
+        parse_error = str(exc)
+
+    if parsed is not None:
+        if has_think_in_visible:
+            findings.append(
+                "WARN: response contains <think>...</think> blocks but "
+                "still parses as JSON after stripping. The provider is "
+                "leaking its reasoning trace. Consider "
+                "LLM_REASONING_SPLIT=true or LLM_THINKING_MODE=disabled."
+            )
+        else:
+            findings.append(
+                "PASS: response parses as a JSON dict without "
+                "thinking-block contamination."
+            )
+    else:
+        # First parse failed. Try the retry-repair path so we exercise
+        # the same recovery that `extract` and `review-opportunities`
+        # use in production.
+        findings.append(
+            f"INFO: initial parse failed ({parse_error}); "
+            "sending repair prompt..."
+        )
+
+        def _llm_complete(messages: list[LLMMessage]) -> str:
+            return provider.complete(
+                messages,
+                temperature=0.0,
+                max_tokens=300,
+            ).content
+
+        repair = make_repair_callback(
+            _llm_complete,
+            schema_hint='{"ok": true, "model_acknowledged": "<model-name>"}',
+        )
+        result = parse_with_repair(content, repair=repair)
+        if result.value is not None:
+            findings.append(
+                "PASS: repair path recovered a valid JSON dict."
+            )
+        else:
+            findings.append(
+                f"FAIL: response did not parse as JSON, and the "
+                f"repair-retry also failed: {result.last_error}"
+            )
+
+    typer.echo("")
+    typer.echo("---- findings ----")
+    for f in findings:
+        typer.echo(f)
+    typer.echo("------------------")
+
+    if any(f.startswith("FAIL") for f in findings):
+        raise typer.Exit(code=2)
+    typer.echo("OK: LLM smoke test passed.")
 
 
 if __name__ == "__main__":

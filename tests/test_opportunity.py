@@ -15,7 +15,11 @@ import pytest
 from founder_radar.analysis.opportunity import (
     HeuristicExtractor,
     LLMBasedExtractor,
-    _parse_llm_json,
+)
+from founder_radar.analysis.llm_json import (
+    extract_json,
+    LLMJsonError,
+    ERROR_PREVIEW_CHARS,
 )
 from founder_radar.database.models import Post
 from founder_radar.llm.base import BaseLLMProvider, LLMMessage, LLMResponse
@@ -281,22 +285,28 @@ def test_llm_extractor_falls_back_on_partial_json() -> None:
 # -------------------------------------------------------------------------
 def test_parse_llm_json_direct() -> None:
     raw = json.dumps({"a": 1, "b": [2, 3]})
-    assert _parse_llm_json(raw) == {"a": 1, "b": [2, 3]}
+    assert extract_json(raw) == {"a": 1, "b": [2, 3]}
 
 
 def test_parse_llm_json_strips_markdown_fences() -> None:
     raw = "```json\n" + json.dumps({"a": 1}) + "\n```"
-    assert _parse_llm_json(raw) == {"a": 1}
+    assert extract_json(raw) == {"a": 1}
+
+
+def test_parse_llm_json_strips_think_blocks() -> None:
+    """Reasoning models like MiniMax-M3 inline <think>...</think> blocks."""
+    raw = "<think>\nLet me analyze this carefully...\n</think>\n" + json.dumps({"a": 1})
+    assert extract_json(raw) == {"a": 1}
 
 
 def test_parse_llm_json_finds_subspan() -> None:
     raw = "Some leading text. " + json.dumps({"a": 1}) + " trailing noise."
-    assert _parse_llm_json(raw) == {"a": 1}
+    assert extract_json(raw) == {"a": 1}
 
 
 def test_parse_llm_json_raises_on_garbage() -> None:
-    with pytest.raises(ValueError, match="not valid JSON"):
-        _parse_llm_json("not json at all")
+    with pytest.raises(LLMJsonError):
+        extract_json("not json at all")
 
 
 # -------------------------------------------------------------------------

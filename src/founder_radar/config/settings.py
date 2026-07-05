@@ -65,6 +65,80 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", description="API key for the LLM endpoint")
     llm_model: str = Field(default="gpt-4o-mini", description="Default LLM model name")
 
+    # Provider-specific extras (V2.1: MiniMax-M3 reasoning support).
+    # These are intentionally generic so they cover MiniMax-M3, DeepSeek,
+    # Anthropic Claude with extended thinking, OpenAI o1-family, and any
+    # future reasoning model that speaks the OpenAI Chat Completions shape.
+    #
+    # LLM_REASONING_SPLIT=true asks providers like MiniMax-M3 to return
+    # the reasoning trace in a SEPARATE field (reasoning_content /
+    # reasoning_text) instead of inlining it into message.content. The
+    # provider then sets content="" + a parallel reasoning field, which
+    # keeps strict-JSON contracts intact.
+    #
+    # LLM_THINKING_MODE controls the reasoning-mode field. Allowed:
+    # "disabled" (no reasoning), "adaptive" (model decides),
+    # "enabled" (always reason), or "empty" (send the field with an
+    # empty value to disable). The actual JSON key the provider expects
+    # varies — see `_build_extra_body()` in openai_provider.py.
+    #
+    # LLM_RESPONSE_FORMAT is the value for the OpenAI `response_format`
+    # field. Allowed: "json_object" (constrain output to valid JSON) or
+    # "none" (skip the field). Default "json_object".
+    llm_reasoning_split: bool = Field(
+        default=False,
+        description=(
+            "Send `extra_body.reasoning_split=true` to the provider. "
+            "MiniMax-M3, DeepSeek, and similar reasoning models "
+            "honour this to keep reasoning out of message.content."
+        ),
+    )
+    llm_thinking_mode: str = Field(
+        default="empty",
+        description=(
+            "Reasoning-mode field. One of: 'disabled', 'adaptive', "
+            "'enabled', 'empty'. 'empty' means send the field with an "
+            "empty value (MiniMax-M3 convention) to disable reasoning."
+        ),
+    )
+    llm_response_format: str = Field(
+        default="json_object",
+        description=(
+            "Value for the OpenAI `response_format` field. One of: "
+            "'json_object' (constrain output to valid JSON) or 'none' "
+            "(skip the field). Default 'json_object'."
+        ),
+    )
+
+    # HTTP timeout for LLM provider requests. Reasoning-model responses can
+    # be slow (and the provider may be a local server); 120s is a
+    # comfortable default. Set lower for quick smoke tests, higher if the
+    # provider routinely takes >60s.
+    llm_timeout_seconds: float = Field(
+        default=120.0, ge=1.0, le=3600.0,
+        description=(
+            "HTTP timeout for LLM provider requests in seconds. "
+            "Default 120. Reasoning-model responses can be slow; "
+            "raise this if you see httpx.TimeoutException."
+        ),
+    )
+
+    # When True (default), the provider strips <think>...</think> blocks
+    # from the model's response.content before returning it to callers.
+    # Reasoning models (MiniMax-M3, DeepSeek R1, o1-family) inline their
+    # chain-of-thought into message.content when reasoning_split=true is
+    # NOT honored by the provider. Stripping here is a safety net so the
+    # downstream JSON parser sees clean content.
+    llm_strip_thinking_always: bool = Field(
+        default=True,
+        description=(
+            "Strip <think>...</think> blocks from the model's response "
+            "before returning it. Default True for reliability with "
+            "reasoning models. Set False only when you want to inspect "
+            "the raw response (e.g. in llm-smoke-test --debug-request)."
+        ),
+    )
+
     # -------------------------------------------------------------------------
     # Database
     # -------------------------------------------------------------------------
@@ -139,6 +213,54 @@ class Settings(BaseSettings):
         description=(
             "User-Agent string for HN API requests. HN asks that bot operators "
             "identify themselves with a contact URL or address."
+        ),
+    )
+
+    # -------------------------------------------------------------------------
+    # GitHub Issues (no-auth by default; token optional for higher rate limits)
+    # -------------------------------------------------------------------------
+    # GitHub's public REST API allows 60 unauthenticated requests/hour per IP.
+    # Setting GITHUB_TOKEN raises the limit to 5,000/hour. We never *require*
+    # the token — collectors work without it — but rate-limit-aware users
+    # should set one. See README for how to mint a token.
+    github_token: str = Field(
+        default="",
+        description=(
+            "Optional GitHub personal access token. Raises the REST API "
+            "rate limit from 60/hour (anonymous) to 5000/hour (authenticated)."
+        ),
+    )
+    github_user_agent: str = Field(
+        default="founder-radar/0.1 (GitHub Issues collector; see project README)",
+        description=(
+            "User-Agent string for GitHub API requests. GitHub requires a "
+            "unique UA and recommends including a contact URL."
+        ),
+    )
+    github_api_base: str = Field(
+        default="https://api.github.com",
+        description="Base URL for GitHub's REST API. Override for GitHub Enterprise.",
+    )
+    # When True, issues authored by automated bot accounts (dependabot,
+    # renovate, github-actions, etc.) are kept and tagged with a
+    # subtype='bot_update' marker so downstream code can downrank them.
+    # When False (default), bot-typed issues are silently skipped at
+    # collection time.
+    github_include_bots: bool = Field(
+        default=False,
+        description=(
+            "Keep issues authored by automated bot accounts. "
+            "When False (default), bot issues are filtered out at collection."
+        ),
+    )
+    # When True, "template-only" issues (no body, no useful title) are kept.
+    # When False (default), they are filtered out — these are usually blank
+    # issue-form submissions and rarely carry actionable pain signals.
+    github_include_templates: bool = Field(
+        default=False,
+        description=(
+            "Keep template-only issues (no body, generic title). "
+            "When False (default), these are filtered at collection time."
         ),
     )
 

@@ -27,12 +27,18 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterable
 
+from founder_radar.analysis.llm_json import (
+    parse_with_repair,
+    LLMJsonError,
+    ERROR_PREVIEW_CHARS,
+)
 from founder_radar.analysis.reality_check import run_reality_check
 from founder_radar.analysis.reality_validator import assess_reality
 from founder_radar.analysis.scoring import (
-    ScoreFactors,
-    compute_deterministic_scores,
+ScoreFactors,
+compute_deterministic_scores,
 )
+from founder_radar.analysis.trends import run_trend_analysis
 from founder_radar.analysis.trends import run_trend_analysis
 from founder_radar.llm.base import BaseLLMProvider, LLMMessage
 
@@ -383,47 +389,91 @@ class LLMBasedExtractor(BaseExtractor):
             "Return the JSON object as specified."
         )
 
-        response = self._llm.complete(
-            [
-                LLMMessage(role="system", content=_SYSTEM_PROMPT),
-                LLMMessage(role="user", content=user_prompt),
-            ],
-            temperature=0.2,
-            max_tokens=800,
+        messages = [
+            LLMMessage(role="system", content=_SYSTEM_PROMPT),
+            LLMMessage(role="user", content=user_prompt),
+        ]
+
+        # Initial call. Capture BOTH the content and the model name
+        # from the LLMResponse so downstream display shows the real
+        # model (not a fallback). Tests use FakeLLMProvider which sets
+        # `model="fake-model"`; real providers surface their actual
+        # model in `LLMResponse.model`.
+        try:
+            initial_response = self._llm.complete(
+                messages,
+                temperature=0.2,
+                max_tokens=800,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"LLM provider call failed: {exc}") from exc
+        initial_content = initial_response.content
+        initial_model = initial_response.model
+
+        # One retry-repair pass on parse failure (V2.1, brief task 3).
+        # The repair callback asks the LLM to convert its previous
+        # (failed) output back into valid JSON. If the repair call
+        # itself fails, parse_with_repair returns value=None and we
+        # raise — the outer extract() catches and falls back to the
+        # heuristic extractor.
+        def _repair_callback(failed_preview: str) -> str | None:
+            repair_messages = [
+                LLMMessage(
+                    role="system",
+                    content=(
+                        "You are a strict JSON repair assistant. Given "
+                        "the assistant's previous response, output ONLY "
+                        "valid JSON — no commentary, no markdown fences, "
+                        "no <think>...</think> blocks, no prose."
+                    ),
+                ),
+                LLMMessage(
+                    role="user",
+                    content=(
+                        f"The previous response could not be parsed as "
+                        f"JSON. Convert it into valid JSON matching "
+                        f"the original schema.\n\n"
+                        f"--- Previous response (first {ERROR_PREVIEW_CHARS} "
+                        f"chars) ---\n{failed_preview}"
+                    ),
+                ),
+            ]
+            try:
+                return self._llm.complete(
+                    repair_messages,
+                    temperature=0.0,
+                    max_tokens=800,
+                ).content
+            except Exception as exc:
+                logger.warning(
+                    "LLM repair call failed for cluster %d: %s",
+                    cluster_id, exc,
+                )
+                return None
+
+        result = parse_with_repair(
+            initial_content,
+            repair=_repair_callback,
         )
+        if result.value is None:
+            preview = (
+                result.last_content[:ERROR_PREVIEW_CHARS]
+                if result.last_content else ""
+            )
+            raise LLMJsonError(
+                f"LLM extraction failed for cluster {cluster_id} "
+                f"after {result.attempts} attempt(s): "
+                f"{result.last_error}",
+                preview=preview,
+            )
+        # Use the model name from the INITIAL response (not the
+        # repair response — that's a repair, not the real model).
+        # Fall back to the provider's best-effort name only when the
+        # provider doesn't surface a model name in its response.
+        model_name = initial_model or _model_name(self._llm)
+        return result.value, model_name
 
-        parsed = _parse_llm_json(response.content)
-        return parsed, response.model
 
-
-def _parse_llm_json(content: str) -> dict:
-    """Parse the LLM's response as JSON, tolerating markdown fences / prose."""
-    text = content.strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    if text.startswith("```"):
-        first_nl = text.find("\n")
-        if first_nl != -1:
-            text = text[first_nl + 1:]
-        if text.endswith("```"):
-            text = text[:-3]
-
-    try:
-        return json.loads(text.strip())
-    except json.JSONDecodeError:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start:end + 1]
-        return json.loads(candidate)
-
-    raise ValueError("LLM response is not valid JSON")
 
 
 def _model_name(llm: BaseLLMProvider) -> str:

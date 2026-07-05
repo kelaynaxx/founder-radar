@@ -53,6 +53,11 @@ class RawPost:
     thread_id: str | None = None
     parent_id: str | None = None
     item_type: str | None = None
+    # Phase 4+ calibration tag. The HN collector derives this from the
+    # title prefix and item type (e.g. "Ask HN:" -> "ask_hn"). Used by
+    # downstream code to downrank pure Show HN launches, etc. See the
+    # Post.subtype column docstring for the full taxonomy.
+    subtype: str | None = None
 
 
 class BaseCollector(ABC):
@@ -154,9 +159,11 @@ def register_builtins() -> None:
     Imported lazily so the `__init__.py` doesn't pull heavy libraries
     (PRAW, etc.) just because someone imported the package.
     """
+    from founder_radar.collectors.github import GitHubIssuesCollector
     from founder_radar.collectors.hackernews import HackerNewsCollector
     from founder_radar.collectors.reddit import RedditCollector
 
+    registry.register(GitHubIssuesCollector)
     registry.register(HackerNewsCollector)
     registry.register(RedditCollector)
 

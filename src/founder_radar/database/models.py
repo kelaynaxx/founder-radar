@@ -128,6 +128,18 @@ class Post(Base):
             "NULL for non-HN sources or posts predating the change."
         ),
     )
+    # Phase 4+ subtype tag (HN-specific). Derived by the HN collector
+    # from the item's title and type. Used downstream to downrank
+    # pure Show HN launches, Ask HN noise, etc. The user explicitly
+    # asked us NOT to change scoring yet — this is just a tag.
+    subtype: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+        doc=(
+            "Calibration tag derived by the HN collector. One of: "
+            "'ask_hn', 'show_hn', 'regular_story', 'regular_comment', "
+            "'job'. NULL for non-HN sources or posts predating the change."
+        ),
+    )
 
     created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     collected_at: Mapped[datetime] = mapped_column(
@@ -343,6 +355,84 @@ class Opportunity(Base):
     status: Mapped[str] = mapped_column(
         String(16), default="new", nullable=False,
         doc="'new', 'confirmed', 'dismissed', 'archived'.",
+    )
+
+    # -------------------------------------------------------------------------
+    # Phase 4+ signal calibration (opportunity type classification)
+    # -------------------------------------------------------------------------
+    # Orthogonal to weighted_score. The brief says: many extracted
+    # opportunities are repo-specific bugs or maintenance issues, not
+    # real product opportunities. These fields let the user filter for
+    # the kinds of problems that actually have standalone-product
+    # potential, without changing the existing ranking math.
+    opportunity_type: Mapped[str] = mapped_column(
+        String(32), default="unknown", nullable=False, index=True,
+        doc=(
+            "One of: 'repo_specific_bug', 'documentation_confusion', "
+            "'missing_feature', 'integration_pain', "
+            "'developer_workflow_pain', 'infra_operational_pain', "
+            "'security_compliance_pain', 'potential_product', 'unknown'. "
+            "Deterministic; see analysis/opportunity_type.py."
+        ),
+    )
+    productizability_score: Mapped[float] = mapped_column(
+        default=0.0, nullable=False, index=True,
+        doc=(
+            "[0,1] How strongly this cluster resembles a buildable "
+            "standalone product. Independent of weighted_score."
+        ),
+    )
+    productizability_reason: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        doc=(
+            "Short human-readable explanation of the type classification, "
+            "surfaced by `founder-radar productizable`."
+        ),
+    )
+
+    # -------------------------------------------------------------------------
+    # Phase 4+ LLM-assisted opportunity review (triage filter)
+    # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Phase 4+ LLM-assisted opportunity review (triage filter)
+    # -------------------------------------------------------------------------
+    # Optional review layer that runs on top of the deterministic
+    # `opportunity_type` + `productizability_score`. Acts like a strict
+    # startup-analyst filter: by default `review_verdict='reject'`, only
+    # `strong_candidate` when there is clear repeated pain + clear
+    # buyer + plausible standalone tool. Populated by
+    # `analysis/opportunity_review.py` via `founder-radar
+    # review-opportunities`. NULL on freshly extracted opportunities
+    # that haven't been reviewed yet.
+    review_verdict: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True,
+        doc=(
+            "One of: 'reject', 'maybe', 'strong_candidate'. NULL means "
+            "the opportunity has not been reviewed yet. Default for "
+            "all un-reviewed opportunities is 'reject' (when surfaced "
+            "by the CLI)."
+        ),
+    )
+    review_reasons_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        doc=(
+            "JSON list[str] of `ReviewReason` tags from the review layer, "
+            "e.g. ['upstream_bug', 'maintenance_chore']."
+        ),
+    )
+    review_summary: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        doc=(
+            "Free-form 1-3 sentence justification written by the review "
+            "LLM. Quoted evidence from source posts is required."
+        ),
+    )
+    review_confidence: Mapped[float] = mapped_column(
+        default=0.0, nullable=False,
+        doc=(
+            "[0,1] the review LLM's self-reported confidence in its own "
+            "verdict. Surfaced for audit; does not affect ranking."
+        ),
     )
 
     # Timestamps

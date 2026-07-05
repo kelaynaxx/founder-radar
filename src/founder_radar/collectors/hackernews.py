@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 
 # HN Firebase endpoints. Public, no auth.
 HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
+# Algolia HN Search API. Used when the user passes --query. Returns full
+# HN item hits (no /item/{id}.json follow-up needed). Public, no auth.
+HN_ALGOLIA_BASE = "https://hn.algolia.com/api/v1/search"
 
 # Story-type names accepted by `collect(categories=...)`. Order matters
 # only insofar as it controls the order in which feeds are processed.
@@ -132,6 +135,7 @@ class HackerNewsCollector(BaseCollector):
         *,
         categories: list[str] | None = None,
         limit_per_category: int | None = None,
+        query: str | None = None,
     ) -> Iterator[RawPost]:
         """Yield RawPost objects from each requested HN story type.
 
@@ -142,12 +146,30 @@ class HackerNewsCollector(BaseCollector):
             limit_per_category: Max items to fetch per story type. When
                 None, falls back to `settings.scan_limit_per_subreddit`
                 (renamed semantically — keeps config surface small).
+            query: When set, use Algolia HN Search API instead of the
+                Firebase story-list endpoints. Useful for ad-hoc
+                calibration queries (e.g. "pain problem frustrated").
+                Story type filters are applied as Algolia `tags`.
         """
         story_types = categories or self._settings.hn_story_type_list
         limit = (
             limit_per_category
             or getattr(self._settings, "scan_limit_per_subreddit", 50)
         )
+
+        if query:
+            # Full-text search path via Algolia. We bypass the Firebase
+            # story-list endpoints entirely and hit the search API which
+            # returns full HN item hits directly (no /item/{id}.json
+            # follow-up needed). When the user also passes story_types,
+            # we add them as `tags` so e.g. only "ask_hn" or "show_hn"
+            # hits are returned.
+            yield from self._collect_via_algolia(
+                query=query,
+                story_types=story_types,
+                limit=limit,
+            )
+            return
 
         if not story_types:
             logger.warning("No HN story types configured; nothing to collect.")
@@ -212,6 +234,86 @@ class HackerNewsCollector(BaseCollector):
                 yield from self._collect_comments(
                     client, item, story_type, thread_root_id=sid
                 )
+
+    def _collect_via_algolia(
+        self,
+        *,
+        query: str,
+        story_types: list[str],
+        limit: int,
+    ) -> Iterator[RawPost]:
+        """Collect via the Algolia HN Search API.
+
+        Story type filters are passed as Algolia `tags` so the same
+        story-type list used by the Firebase path also narrows the
+        search. We use `tags=story` by default to exclude comments and
+        jobs from the result set.
+        """
+        client = self._client()
+
+        params: list = [f"query={query}", "tags=story", f"hitsPerPage={limit}"]
+        # Map our internal story_type names to Algolia's tag namespace.
+        # We support the four the brief asks for (ask, show, top, new)
+        # plus the existing feed names.
+        type_to_tag = {
+            "askstories": "ask_hn",
+            "showstories": "show_hn",
+            "topstories": "story",        # top isn't a separate tag
+            "newstories": "story",
+            "beststories": "story",
+            "jobstories": None,           # jobs handled below
+        }
+        extra_tags: list = []
+        for st in story_types:
+            tag = type_to_tag.get(st)
+            if tag == "ask_hn" or tag == "show_hn":
+                # Algolia uses these as additional tags. Ask/Show HN
+                # also imply the broader `story` tag, so add it.
+                extra_tags.append(tag)
+                if "story" not in extra_tags:
+                    extra_tags.append("story")
+            elif tag == "story":
+                if "story" not in extra_tags:
+                    extra_tags.append("story")
+        for t in extra_tags:
+            params.append(f"tags={t}")
+        # De-dup adjacent tag params (e.g. if user passed both top
+        # and askstories, we should only emit tags=story once).
+        seen = set()
+        deduped: list = []
+        for p in params:
+            if p in seen:
+                continue
+            seen.add(p)
+            deduped.append(p)
+        params = deduped
+
+        url = f"{HN_ALGOLIA_BASE}?{'&'.join(params)}"
+        try:
+            resp = client.get(url)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.error("Algolia HN search failed: %s", exc)
+            return
+        try:
+            data = resp.json()
+        except (ValueError, TypeError) as exc:
+            logger.error("Bad JSON from Algolia: %s", exc)
+            return
+        hits = data.get("hits", []) if isinstance(data, dict) else []
+        if not hits:
+            return
+        # Algolia returns the same shape as the Firebase item endpoint
+        # for each hit, so we can reuse _item_to_raw_post directly.
+        # The story type is the source_category (= what the user passed
+        # via --story-type, after alias resolution upstream).
+        source_category = ",".join(story_types) if story_types else "algolia"
+        for hit in hits[:limit]:
+            post = self._item_to_raw_post(
+                hit, source_category
+            )
+            if post is not None:
+                yield post
 
     def _collect_comments(
         self,
@@ -381,6 +483,8 @@ class HackerNewsCollector(BaseCollector):
             parent_id = None
         final_item_type = item_type or None
 
+        subtype = _derive_subtype(item, item_type, title=title, is_comment=is_comment)
+
         return RawPost(
             source=self.source_name,
             external_id=str(item_id),
@@ -396,6 +500,7 @@ class HackerNewsCollector(BaseCollector):
             thread_id=final_thread_id,
             parent_id=parent_id,
             item_type=final_item_type,
+            subtype=subtype,
         )
 
 
@@ -432,3 +537,43 @@ def _safe_int(value, *, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+
+def _derive_subtype(
+    item: dict,
+    item_type: str,
+    *,
+    title: str | None,
+    is_comment: bool,
+) -> str:
+    """Translate one HN item into a calibration subtype tag.
+
+    Used by the downstream scoring/filtering layer (future) to
+    downrank pure Show HN launches and surface Ask HN problem posts.
+    The user asked us NOT to change scoring yet — this is just a
+    tag. The taxonomy:
+
+        ask_hn           "Ask HN:" title prefix + type=story
+        show_hn          "Show HN:" title prefix + type=story
+        regular_story    type=story, no Ask/Show prefix
+        regular_comment  type=comment
+        job              type=job
+
+    Returns one of those strings, or "regular_story" as a safe
+    default for unknown shapes.
+    """
+    if is_comment or item_type == "comment":
+        return "regular_comment"
+    if item_type == "job":
+        return "job"
+    if item_type != "story":
+        return "regular_story"
+    # item_type == "story" from here
+    if title:
+        t = title.strip()
+        if t.lower().startswith("ask hn:"):
+            return "ask_hn"
+        if t.lower().startswith("show hn:"):
+            return "show_hn"
+    return "regular_story"
