@@ -4,11 +4,11 @@ V2.1 (MiniMax-M3 reasoning support). This module centralises the
 "give me a JSON object out of an LLM response" pipeline that used
 to live inline in `opportunity.py` and `opportunity_review.py`. The
 two call sites had drifted apart and neither handled reasoning-model
-output (`<think>...</think>` blocks), so we unified them here.
+output (`<!-- raw HTML removed -->...<!-- raw HTML removed -->` blocks), so we unified them here.
 
 The extraction pipeline (in order):
-  1. Strip leading/trailing `<think>...</think>` blocks (case
-     insensitive, multi-line).
+  1. Strip leading/trailing thinking-tag blocks (`<!-- raw HTML removed -->`,
+     `<thinking>`, `<reasoning>`, case-insensitive, multi-line).
   2. Strip markdown code fences (`\\`\\`json ... \\`\\``).
   3. Find the first balanced `{...}` block in the remaining text.
   4. Try `json.loads()` on each candidate. Return the first dict.
@@ -72,27 +72,107 @@ class LLMJsonError(ValueError):
 # -----------------------------------------------------------------------------
 # Public helpers
 # -----------------------------------------------------------------------------
+
+# Reasoning-model tag names to strip. Order matters: longest first so
+# that "<thinking>" is matched before any shorter alias. The primary
+# MiniMax-M3 / DeepSeek R1 / OpenAI o1-style block is `<!-- raw HTML removed -->...<!-- raw HTML removed -->`,
+# but other tags appear in the wild and the stripper must cope with all
+# of them (and unterminated variants).
+_THINKING_TAGS: tuple[str, ...] = ("thinking", "think", "reasoning")
+
+# Keywords that flag an HTML comment block as a reasoning trace.
+# Unrelated comments are intentionally left alone; see the gated
+# fallback in `_strip_html_comments_if_reasoning`.
+_REASONING_KEYWORDS = ("reason", "think", "step", "analysis")
+
+# Pre-compiled at module load so we don't recompile per LLM response.
+# Each open pattern matches an opening tag with optional attributes
+# (e.g. `<think role="x">`); each close pattern matches the closing tag.
+_OPEN_TAG_PATTERNS: dict[str, "re.Pattern[str]"] = {
+    tag: re.compile(rf"<{tag}\b[^>]*>", re.IGNORECASE)
+    for tag in _THINKING_TAGS
+}
+_CLOSE_TAG_PATTERNS: dict[str, "re.Pattern[str]"] = {
+    tag: re.compile(rf"</{tag}\s*>", re.IGNORECASE)
+    for tag in _THINKING_TAGS
+}
+_HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _strip_one_tag(content: str, tag: str) -> str:
+    """Strip one tag family (e.g. ``<!-- raw HTML removed -->...<!-- raw HTML removed -->``).
+
+    Handles three shapes:
+      1. Balanced: `<tag>...</tag>` -- drop the tag pair.
+      2. Unterminated opening (`<tag>` + json at EOF, no `</tag>`) --
+         drop from the opening tag to end-of-string.
+      3. Stray closing (`</tag>` only, no opening) -- drop the stray close.
+
+    Loops because stripping can expose a second occurrence of the same
+    tag further down the string.
+    """
+    open_pat = _OPEN_TAG_PATTERNS[tag]
+    close_pat = _CLOSE_TAG_PATTERNS[tag]
+    while True:
+        open_match = open_pat.search(content)
+        if open_match is None:
+            # No more opening tags. Strip any stray closing tags.
+            if close_pat.search(content):
+                content = close_pat.sub("", content)
+            return content
+        close_match = close_pat.search(content, open_match.end())
+        if close_match is None:
+            # Unterminated: drop from the opening tag to EOF.
+            return content[: open_match.start()]
+        # Balanced: drop from opening tag to end of closing tag.
+        content = content[: open_match.start()] + content[close_match.end():]
+
+
+def _strip_html_comments_if_reasoning(content: str) -> str:
+    """Defensive fallback: strip HTML comments that look like reasoning.
+
+    Only strips comments whose body contains one of
+    `_REASONING_KEYWORDS`. Other HTML comments are preserved verbatim --
+    this avoids accidentally eating user-authored `<!-- TODO -->` markers
+    or other tool-emitted comments.
+
+    This is NOT the primary MiniMax-M3 case; literal
+    `<!-- raw HTML removed -->...<!-- raw HTML removed -->`, `<thinking>`, and `<reasoning>` tags are stripped
+    by the primary pass above. This is a defense-in-depth fallback for
+    future model variants.
+    """
+    def _replace(match: "re.Match[str]") -> str:
+        body = match.group(0).lower()
+        if any(keyword in body for keyword in _REASONING_KEYWORDS):
+            return ""
+        return match.group(0)
+    return _HTML_COMMENT_PATTERN.sub(_replace, content)
+
+
 def strip_thinking_blocks(content: str) -> str:
-    """Remove all `<think>...</think>` blocks from `content`.
+    """Remove reasoning-model inline blocks from `content`.
 
-    Reasoning models (MiniMax-M3, DeepSeek R1, OpenAI o1, etc.) often
-    inline their chain-of-thought into `message.content` before the
-    real answer. The block can be multiline; we strip greedily.
+    Strips three tag families (`<!-- raw HTML removed -->`, `<thinking>`,
+    `<reasoning>`) and their unterminated variants, all case-insensitive.
+    As a defensive fallback, HTML-comment blocks are also stripped when
+    their body looks like a reasoning trace (contains one of `reason`,
+    `think`, `step`, `analysis`).
 
-    Tolerant: if the closing tag is missing, we still strip up to
-    the end of the content (the model went off the rails). If there
-    is no `<think>` tag at all, the content is returned unchanged.
+    Reasoning models (MiniMax-M3, DeepSeek R1, OpenAI o1, etc.)
+    occasionally inline their chain-of-thought into `message.content`
+    before the real answer. The block can be multiline; we strip
+    greedily. Tolerant: if the closing tag is missing, we drop from
+    the opening tag to the end of the content.
+
+    If no thinking-tag signal is present in `content`, it is returned
+    unchanged.
     """
     if not content:
         return content
-    pattern = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-    stripped = pattern.sub("", content)
-    # Handle unterminated <think>... (no closing tag). Strip from
-    # the opening tag to the end of the content. Useful for malformed
-    # responses that forgot to close the block.
-    if "<think>" in stripped.lower():
-        idx = stripped.lower().find("<think>")
-        stripped = stripped[:idx] + stripped[stripped.lower().find("</think>", idx) + len("</think>>"):]
+    stripped = content
+    for tag in _THINKING_TAGS:
+        stripped = _strip_one_tag(stripped, tag)
+    stripped = _strip_html_comments_if_reasoning(stripped)
     return stripped.strip()
 
 
@@ -162,7 +242,7 @@ def extract_json(content: str) -> dict:
 
     Pipeline (each step runs only if the previous failed):
       1. Direct `json.loads(content)` (works for clean JSON).
-      2. Strip `<think>...</think>` blocks, then direct parse.
+      2. Strip thinking-tag blocks, then direct parse.
       3. Strip markdown fences, then direct parse.
       4. Find the first balanced `{...}` substring, then parse.
       5. Combine strips (1 + 2 + 3), then try balanced extraction.
@@ -338,7 +418,7 @@ def make_repair_callback(
     the LLM to convert the failed content into valid JSON matching
     `schema_hint`.
 
-    Returns None from `llm_complete` to signal "give up" — the
+    Returns None from `llm_complete` to signal "give up" -- the
     callback will return None and the repair loop aborts.
     """
     def repair(failed_preview: str) -> str | None:
@@ -354,8 +434,8 @@ def make_repair_callback(
                 content=(
                     "You are a strict JSON repair assistant. "
                     "Given the assistant's previous response, output "
-                    "ONLY valid JSON — no commentary, no markdown "
-                    "fences, no <think>...</think> blocks, no prose."
+                    "ONLY valid JSON -- no commentary, no markdown "
+                    "fences, no thinking-block tags of any kind, no prose."
                 ),
             ),
             LLMMessage(

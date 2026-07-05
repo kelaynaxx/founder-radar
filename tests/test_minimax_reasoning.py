@@ -101,15 +101,16 @@ def test_strip_thinking_blocks_removes_think_with_answer() -> None:
 
 
 def test_strip_thinking_blocks_handles_unterminated_think() -> None:
-    """An unterminated <think> block (no closing tag) is also stripped."""
+    """An unterminated <think> block (no closing tag) is also stripped.
+
+    Semantics: drop the opening tag through end-of-string. We do NOT
+    try to recover JSON appearing after an unterminated tag because a
+    truncated tag is ambiguous -- we treat it as terminal.
+    """
     raw = '<think>still going...\n{"x": 1}'
     stripped = strip_thinking_blocks(raw)
-    # The opening tag and everything up to "</think>" (or EOF) is dropped.
-    # Without a closing tag we keep the JSON part.
-    assert "<think>" not in stripped
-    assert "{" in stripped
-
-
+    assert "<" not in stripped
+    assert stripped == ""
 def test_strip_thinking_blocks_case_insensitive() -> None:
     raw = '<THINK>noise</THINK>{"a": 1}'
     assert strip_thinking_blocks(raw) == '{"a": 1}'
@@ -1037,3 +1038,123 @@ def test_llm_smoke_test_reports_unparseable_response(
 
     assert result.exit_code == 2, result.stdout
     assert "FAIL" in result.output
+
+# -------------------------------------------------------------------------
+# V2.2 widening regression tests (stripper, smoke-test detection, debug-request)
+# -------------------------------------------------------------------------
+def test_strip_thinking_blocks_removes_thinking_tag_with_answer() -> None:
+    raw = "<thinking>careful analysis</thinking>" + '{"x": 1}'
+    assert strip_thinking_blocks(raw) == '{"x": 1}'
+
+def test_strip_thinking_blocks_removes_reasoning_tag_with_answer() -> None:
+    raw = "<reasoning>thinking here</reasoning>" + '{"a": 1}'
+    assert strip_thinking_blocks(raw) == '{"a": 1}'
+
+def test_strip_thinking_blocks_handles_unterminated_thinking() -> None:
+    raw = "<thinking>still going" + chr(92) + "n" + '{"y": 2}'
+    stripped = strip_thinking_blocks(raw)
+    assert "<" not in stripped
+    assert stripped == ""
+
+def test_strip_thinking_blocks_handles_unterminated_reasoning() -> None:
+    raw = "<reasoning>got cut off" + chr(92) + "n" + '{"z": 3}'
+    stripped = strip_thinking_blocks(raw)
+    assert "<" not in stripped
+    assert stripped == ""
+
+def test_strip_thinking_blocks_mixed_think_and_thinking() -> None:
+    raw = "<thinking>first</thinking>remain " + "<think>second</think>" + '{"v": 1}'
+    assert strip_thinking_blocks(raw) == "remain " + '{"v": 1}'
+
+def test_strip_thinking_blocks_html_comment_with_reasoning_keyword_stripped() -> None:
+    raw = "<!-- reasoning: yes -->" + chr(123) + chr(34) + "m" + chr(34) + chr(125)
+    assert strip_thinking_blocks(raw) == chr(123) + chr(34) + "m" + chr(34) + chr(125)
+
+def test_strip_thinking_blocks_html_comment_without_reasoning_keyword_preserved() -> None:
+    raw = "<!-- TODO: refactor -->" + chr(123) + chr(34) + "p" + chr(34) + chr(125)
+    assert strip_thinking_blocks(raw) == raw
+
+def test_extract_json_handles_thinking_tag_with_parseable_json() -> None:
+    raw = "<thinking>thought</thinking>" + chr(123) + chr(34) + "k" + chr(34) + chr(58) + " 9" + chr(125)
+    assert extract_json(raw) == {"k": 9}
+
+def test_extract_json_handles_reasoning_tag_with_parseable_json() -> None:
+    raw = "<reasoning>thought</reasoning>" + chr(123) + chr(34) + "n" + chr(34) + chr(58) + " 8" + chr(125)
+    assert extract_json(raw) == {"n": 8}
+
+def test_make_repair_callback_factory_has_no_self_reference() -> None:
+    import inspect
+    src = inspect.getsource(make_repair_callback)
+    assert "self." not in src, ("make_repair_callback source unexpectedly contains self." + chr(46) + " -- regression returned")
+
+def test_parse_response_inner_callable_does_not_reference_self() -> None:
+    from founder_radar.analysis.opportunity_review import _parse_response
+    import inspect, re
+    src = inspect.getsource(_parse_response)
+    assert "def _llm_complete" in src
+    assert re.search(r"make_repair_callback\(\s*_llm_complete", src), src[:200]
+    assert "self._llm" not in src
+
+def test_llm_smoke_test_debug_request_prints_base_url() -> None:
+    from typer.testing import CliRunner
+    from unittest.mock import patch, MagicMock
+    from founder_radar.main import app
+
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "model": "fake-model"}
+    fake_response.raise_for_status = MagicMock()
+
+    with patch("httpx.Client.post", return_value=fake_response):
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["llm-smoke-test", "--debug-request"],
+            env={"LLM_BASE_URL": "https://api.minimax.io/v1", "LLM_API_KEY": "sk-test-secret-987"},
+        )
+        assert result.exit_code == 0, result.output
+        assert "base_url:" in result.output
+        assert "api.minimax.io" in result.output  # echoed from base_url
+        assert "sk-test-secret-987" not in result.output  # sanitized
+        assert "(never printed)" in result.output
+
+def test_llm_smoke_test_warns_on_thinking_tag_with_parseable_json(monkeypatch) -> None:
+    from typer.testing import CliRunner
+    from unittest.mock import patch, MagicMock
+    from founder_radar.main import app
+    from founder_radar.config.settings import get_settings
+
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"choices": [{"message": {"role": "assistant", "content": "<thinking>thought</thinking>{\"k\": 9}"}}], "model": "fake-model"}
+    fake_response.raise_for_status = MagicMock()
+
+    # Disable provider-level stripping so the smoke test sees the raw content.
+    monkeypatch.setenv('LLM_API_KEY', 'sk-test')
+    monkeypatch.setenv('LLM_STRIP_THINKING_ALWAYS', 'false')
+    get_settings.cache_clear()
+
+    with patch('httpx.Client.post', return_value=fake_response):
+        runner = CliRunner()
+        result = runner.invoke(app, ['llm-smoke-test'])
+        assert 'WARN' in result.output, result.output
+        assert 'thinking' in result.output.lower()
+
+def test_llm_smoke_test_warns_on_reasoning_tag_with_parseable_json(monkeypatch) -> None:
+    from typer.testing import CliRunner
+    from unittest.mock import patch, MagicMock
+    from founder_radar.main import app
+    from founder_radar.config.settings import get_settings
+
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"choices": [{"message": {"role": "assistant", "content": "<reasoning>thought</reasoning>{\"k\": 9}"}}], "model": "fake-model"}
+    fake_response.raise_for_status = MagicMock()
+
+    # Disable provider-level stripping so the smoke test sees the raw content.
+    monkeypatch.setenv('LLM_API_KEY', 'sk-test')
+    monkeypatch.setenv('LLM_STRIP_THINKING_ALWAYS', 'false')
+    get_settings.cache_clear()
+
+    with patch('httpx.Client.post', return_value=fake_response):
+        runner = CliRunner()
+        result = runner.invoke(app, ['llm-smoke-test'])
+        assert 'WARN' in result.output, result.output
+        assert 'reasoning' in result.output.lower()

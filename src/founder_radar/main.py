@@ -29,6 +29,7 @@ Phase 3+ (Reality Check + Trends + Weighted Scoring):
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -2151,6 +2152,10 @@ def llm_smoke_test(
             max_tokens=200,
         )
         typer.echo("---- sanitized request payload ----")
+        typer.echo(
+            f"  base_url:                  "
+            f"{settings.llm_base_url!r}"
+        )
         typer.echo(f"  url:                       {provider._url()}")
         typer.echo(f"  model:                     {payload.get('model')!r}")
         typer.echo(
@@ -2269,8 +2274,9 @@ def llm_smoke_test(
     # length or the "raw_response" attribute on LLMResponse. The
     # base provider doesn't carry raw_response, so for the smoke test
     # we approximate with the stripped content.
-    has_think_in_visible = "<think>" in content.lower()
+    _TAG_RE = re.compile(r"</?(think|thinking|reasoning)\b", re.IGNORECASE)
 
+    has_think_in_visible = bool(_TAG_RE.search(content))
     findings: list[str] = []
     parsed = None
     parse_error: str | None = None
