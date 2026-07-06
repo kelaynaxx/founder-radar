@@ -1,4 +1,4 @@
-# Founder Radar
+# WIP - Founder Radar
 
 > Discover software business opportunities by automatically analyzing public discussions.
 
